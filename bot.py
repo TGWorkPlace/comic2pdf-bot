@@ -1,4 +1,5 @@
 import asyncio
+import glob
 import logging
 import os
 import shutil
@@ -112,30 +113,54 @@ async def convert_to_pdf(input_path: str, out_dir: str) -> str:
     Converts a .cbr/.cbz file to .pdf using the `comic2pdf` CLI tool
     (pip install comic2pdf), which internally handles RAR/ZIP extraction
     and image-to-PDF assembly.
+
+    Rather than assuming comic2pdf names the output exactly
+    "<input-basename>.pdf", we snapshot the .pdf files present in out_dir
+    before running, then diff against what's there afterwards. This is
+    robust to comic2pdf sanitizing/renaming the filename, and to it
+    writing relative to the process's cwd instead of -o (we also force
+    cwd=out_dir to cover that case).
     """
+    before = set(glob.glob(os.path.join(out_dir, "*.pdf")))
+
     process = await asyncio.create_subprocess_exec(
         "comic2pdf", "-o", out_dir, "-a", input_path,
+        cwd=out_dir,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await process.communicate()
+    out_text = stdout.decode(errors="ignore").strip()
+    err_text = stderr.decode(errors="ignore").strip()
+    combined = err_text or out_text
 
     if process.returncode != 0:
-        err = (stderr.decode(errors="ignore").strip()
-               or stdout.decode(errors="ignore").strip()
-               or "comic2pdf exited with a non-zero status.")
-        if "unrar" in err.lower() or "rarfile" in err.lower():
+        if "unrar" in combined.lower() or "rarfile" in combined.lower():
             raise ComicConversionError(
                 "This is a `.cbr` (RAR-based) archive and the server is "
-                "missing the `unrar` tool needed to extract it."
+                "missing the `unrar`/`unar` tool needed to extract it."
             )
-        raise ComicConversionError(err)
+        raise ComicConversionError(
+            combined or "comic2pdf exited with a non-zero status."
+        )
 
-    base_name = os.path.splitext(os.path.basename(input_path))[0]
-    pdf_path = os.path.join(out_dir, base_name + ".pdf")
-    if not os.path.exists(pdf_path):
-        raise ComicConversionError("comic2pdf finished but produced no PDF file.")
-    return pdf_path
+    after = set(glob.glob(os.path.join(out_dir, "*.pdf")))
+    new_pdfs = sorted(after - before, key=os.path.getmtime, reverse=True)
+
+    if not new_pdfs:
+        # Fall back to "any pdf in out_dir" in case comic2pdf overwrote
+        # a file that happened to already exist (shouldn't normally
+        # happen since each job gets a fresh directory).
+        if after:
+            new_pdfs = sorted(after, key=os.path.getmtime, reverse=True)
+        else:
+            debug = combined[-500:] if combined else "(no output from comic2pdf)"
+            raise ComicConversionError(
+                "comic2pdf finished but produced no PDF file.\n"
+                f"Output:\n{debug}"
+            )
+
+    return new_pdfs[0]
 
 
 @app.on_message(comic_filter & filters.private)
